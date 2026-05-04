@@ -67,3 +67,18 @@ Pretrained checkpoints are available below. Please download and place them in:
 | Concatenation | Concat | 0.05 | [link] |
 | Concatenation | Concat | 0.1 | [link] |
 | Concatenation | Concat | 0.2 | [link] |
+
+
+## Acknowledgment
+
+This repository includes a modified version of Open-Unmix.
+Original implementation: https://github.com/sigsep/open-unmix-pytorch
+
+The `open-unmix-pytorch/` directory is a modified version of Open-Unmix. The original README is preserved inside that directory, while the paper-specific training scripts are in `open-unmix-pytorch/scripts/`.
+This directory is adapted from Open-Unmix for singer-informed vocal source separation.
+
+Main modifications:
+- Added singer-conditioned separation models.
+- Added concatenation and FiLM conditioning variants.
+- Added SI-SDR training scripts.
+- Added embedding precomputation scripts.
