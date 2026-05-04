@@ -1,0 +1,26 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Environment and local IDE noise
+.DS_Store
+.env
+.venv/
+venv/
+
+# Logs
+*.log
+
+# Large training artifacts (do not commit)
+open-unmix-pytorch/scripts/checkpoints/
+open-unmix-pytorch/scripts/embeddings/
+open-unmix-pytorch/scripts/embeddingsSOLO_clean_embeddings/
+*.pt
+*.pth
+*.chkpnt
+
+# Optional local data outputs
+data/
+artifacts/
