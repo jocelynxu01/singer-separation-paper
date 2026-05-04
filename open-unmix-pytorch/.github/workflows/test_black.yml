@@ -1,0 +1,11 @@
+name: Lint
+on: [pull_request] # yamllint disable-line rule:truthy
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: psf/black@stable
+      with:
+        options: "--check --verbose"
+        version: "~= 24.4.0"
