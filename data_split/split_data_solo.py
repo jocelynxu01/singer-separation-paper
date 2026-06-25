@@ -5,8 +5,8 @@ from pathlib import Path
 import pandas as pd
 
 # ========== CONFIG ==========
-meta_csv = Path("/home/yuex7/openunmix_solo_generated/audio_segments.csv")   # <-- your original meta csv (file_path, segments)
-root_solo = Path("/home/yuex7/openunmix_solo_generated")  # <-- the folder that now contains train/valid/test
+meta_csv = Path("audio_segments.csv") 
+root_solo = Path("openunmix_solo_generated")
 # ============================
 
 out_train = root_solo / "SOLO_train_segments.csv"
