@@ -7,6 +7,10 @@ import torch
 import torch.utils.data
 import torchaudio
 import tqdm
+import os
+
+import soundfile
+import torch.nn.functional as F
 
 
 def load_info(path: str) -> dict:
@@ -39,7 +43,8 @@ def load_audio(
     start: float = 0.0,
     dur: Optional[float] = None,
     info: Optional[dict] = None,
-    target_sample_rate: float = 44100.0,
+    target_sample_rate: float = 44100.0, #44100.0
+    index: int = 0,
 ):
     """Load audio file
 
@@ -65,25 +70,34 @@ def load_audio(
     #     frame_offset = int(start * info["samplerate"])
     #     sig, rate = torchaudio.load(path, num_frames=num_frames, frame_offset=frame_offset)
     #     return sig, rate
-    
-    if dur is None:
-        # Load the entire file
-        sig, original_rate = torchaudio.load(path)
-    else:
-        # Partial load with a specific duration and start offset
-        if info is None:
-            info = load_info(path)
-        num_frames = int(dur * info["samplerate"])
-        frame_offset = int(start * info["samplerate"])
-        sig, original_rate = torchaudio.load(path, num_frames=num_frames, frame_offset=frame_offset)
+    try:
+        if dur is None:
+            # Load full audio file
+            # sig, original_rate = torchaudio.load(path)
+            sig, original_rate = soundfile.read(path, always_2d=True, dtype="float32")
+            sig = torch.as_tensor(sig).T
+        else:
+            # Load partial audio
+            if info is None:
+                info = load_info(path)
+            num_frames = int(dur * info["samplerate"])
+            frame_offset = int(start * info["samplerate"])
+            # sig, original_rate = torchaudio.load(path, num_frames=num_frames, frame_offset=frame_offset)
+            sig, original_rate = soundfile.read(path, start=frame_offset, frames=num_frames or -1, always_2d=True, dtype="float32")
+            sig = torch.as_tensor(sig).T
 
-    # Resample if original sample rate differs from target sample rate
-    if original_rate != target_sample_rate:
-        print('resampling...')
-        resampler = torchaudio.transforms.Resample(orig_freq=original_rate, new_freq=target_sample_rate)
-        sig = resampler(sig)
+        # Check if signal is empty
+        if sig.numel() == 0:
+            raise ValueError(f"Error: Empty signal")
 
-    return sig, target_sample_rate
+        if sig.dim() == 1:
+            sig = sig.unsqueeze(0)  # Convert (samples,) -> (1, samples)
+                        
+        return sig, target_sample_rate
+
+    except Exception as e:
+        print(f"Error loading {path}: {e}")
+        return torch.zeros((1, 264600)), target_sample_rate #this is for 6s
 
 
 def aug_from_str(list_of_function_names: list):
@@ -174,14 +188,14 @@ def load_datasets(
     Returns:
         train_dataset, validation_dataset
     """
+    # I am ALIGNED
     if args.dataset == "aligned":
         parser.add_argument("--input-file", type=str)
         parser.add_argument("--output-file", type=str)
 
         args = parser.parse_args()
         # set output target to basename of output file
-        args.target = Path(args.output_file).stem
-        print(args.target)
+        # args.target = Path(args.output_file).stem # I named it differently, so no
 
         dataset_kwargs = {
             "root": Path(args.root),
@@ -189,9 +203,22 @@ def load_datasets(
             "input_file": args.input_file,
             "output_file": args.output_file,
         }
-        args.target = Path(args.output_file).stem
-        train_dataset = AlignedDataset(split="train", random_chunks=False, **dataset_kwargs)  # type: UnmixDataset
+        
+        print(dataset_kwargs)
+        # train using solo data no emb
+        train_dataset = AlignedDataset(split="train", random_chunks=True, **dataset_kwargs)  # type: UnmixDataset
         valid_dataset = AlignedDataset(split="valid", **dataset_kwargs)  # type: UnmixDataset
+        
+        # train using duet data no emb
+        # train_dataset = DuetAlignedDataset(split="train", random_chunks=True, **dataset_kwargs)
+        # valid_dataset = DuetAlignedDataset(split="valid", **dataset_kwargs)
+        
+        # train_dataset = AlignedDataset_Embeddings(split="train", save_sample=False, random_chunks=True, **dataset_kwargs)  
+        # valid_dataset = AlignedDataset_Embeddings(split="valid", save_sample=False, **dataset_kwargs)  # type: UnmixDataset
+        
+        # train_dataset = AlignedDataset_Embeddings_Background(args, split="train", save_sample=False, random_chunks=True, **dataset_kwargs)  
+        # valid_dataset = AlignedDataset_Embeddings_Background(args, split="valid", save_sample=False, **dataset_kwargs)  # type: UnmixDataset
+        
 
     elif args.dataset == "sourcefolder":
         parser.add_argument("--interferer-dirs", type=str, nargs="+")
@@ -335,14 +362,14 @@ def load_datasets(
 
     return train_dataset, valid_dataset, args
 
-# wait, this might be it!
+
 class AlignedDataset(UnmixDataset):
     def __init__(
         self,
         root: str,
         split: str = "train",
-        input_file: str = "mixture.wav",
-        output_file: str = "vocals.wav",
+        input_file: str = "mixture.wav", # i named it this for the solo test validation purpose.
+        output_file: str = "vocal1.wav",
         seq_duration: Optional[float] = None,
         random_chunks: bool = False,
         sample_rate: float = 44100.0,
@@ -378,7 +405,6 @@ class AlignedDataset(UnmixDataset):
         self.input_file = input_file
         self.output_file = output_file
         self.tuple_paths = list(self._get_paths())
-        print('THE LENGTH IS', len(self.tuple_paths))
         if not self.tuple_paths:
             raise RuntimeError("Dataset is empty, please check parameters")
         self.seed = seed
@@ -397,6 +423,14 @@ class AlignedDataset(UnmixDataset):
 
         X_audio, _ = load_audio(input_path, start=start, dur=self.seq_duration)
         Y_audio, _ = load_audio(output_path, start=start, dur=self.seq_duration)
+        
+        # if X_audio.shape[0] == 2:
+        #     X_audio = X_audio.mean(dim=0, keepdim=True)  # Convert mixture to mono
+            
+        if Y_audio.shape[0] == 1:
+            Y_audio = Y_audio.repeat(2, 1)  # convert vocals to multi
+        if X_audio.shape[0] == 1:
+            X_audio = X_audio.repeat(2, 1)  # convert vocals to multi
         # return torch tensors
         return X_audio, Y_audio
 
@@ -416,11 +450,499 @@ class AlignedDataset(UnmixDataset):
                         output_info = load_info(output_path[0])
                         min_duration = min(input_info["duration"], output_info["duration"])
                         # check if both targets are available in the subfolder
-                        if min_duration >= self.seq_duration:
+                        if min_duration > self.seq_duration:
                             yield input_path[0], output_path[0]
                     else:
                         yield input_path[0], output_path[0]
+                        
+class DuetAlignedDataset(UnmixDataset):
+    def __init__(
+        self,
+        root: str,
+        split: str = "train",
+        seq_duration: Optional[float] = None,
+        random_chunks: bool = False,
+        sample_rate: float = 44100.0,
+        source_augmentations: Optional[Callable] = None,
+        seed: int = 42,
+    ) -> None:
+        """
+        Duet dataset loader.
+        Structure:
+            root/split/anchor/
+                vocal1.wav
+                background.wav
+                partner_X/
+                    vocal2.wav
+                    mixture.wav
+        Returns:
+            mixture, vocal1, vocal2, background
+        """
+        self.root = Path(root).expanduser()
+        self.split = split
+        self.sample_rate = sample_rate
+        self.seq_duration = seq_duration
+        self.random_chunks = random_chunks
+        self.seed = seed
+        random.seed(seed)
 
+        self.tuple_paths = list(self._get_paths())
+        if not self.tuple_paths:
+            raise RuntimeError(f"No duet data found in {root}/{split}")
+
+    # def _get_paths(self):
+    #     """Yield (mixture, vocal1, vocal2, background) file paths."""
+    #     split_root = self.root / self.split
+    #     for anchor_dir in tqdm.tqdm(split_root.iterdir(), desc=f"Scanning {self.split}"):
+    #         if not anchor_dir.is_dir():
+    #             continue
+
+    #         vocal1_path = anchor_dir / "vocal1.wav"
+    #         background_path = anchor_dir / "background.wav"
+    #         if not (vocal1_path.exists() and background_path.exists()):
+    #             continue
+
+    #         for partner_dir in anchor_dir.iterdir():
+    #             if not partner_dir.is_dir():
+    #                 continue
+
+    #             mixture_path = partner_dir / "mixture.wav"
+    #             vocal2_path = partner_dir / "vocal2.wav"
+    #             if all(p.exists() for p in [mixture_path, vocal2_path]):
+    #                 yield mixture_path, vocal1_path, vocal2_path, background_path
+    
+    # this is to test on only the real mixture, not the artificial ones   
+    
+    def _get_anchor_prefix(self, name: str) -> str:
+
+        # "1-KR-ko-1078693035_2933086316-vocal" -> "1-KR-ko-1078693035"
+
+        return name.split('_')[0]
+        
+    def _get_paths(self):
+        split_root = self.root / self.split
+
+        for anchor_dir in tqdm.tqdm(split_root.iterdir(), desc=f"Scanning {self.split}"):
+
+            if not anchor_dir.is_dir():
+                continue
+
+            vocal1_path = anchor_dir / "vocal1.wav"
+            background_path = anchor_dir / "background.wav"
+
+            if not (vocal1_path.exists() and background_path.exists()):
+                continue
+
+            anchor_prefix = self._get_anchor_prefix(anchor_dir.name)
+            partner_dirs = [
+                d for d in anchor_dir.iterdir()
+                if d.is_dir() and d.name.endswith("-vocal2")
+
+            ]
+
+            if len(partner_dirs) == 0:
+
+                continue
+
+            # find partner folder with matching prefix
+
+            matched_partner = None
+
+            for d in partner_dirs:
+
+                if self._get_anchor_prefix(d.name) == anchor_prefix:
+
+                    matched_partner = d
+
+                    break
+
+            if matched_partner is None:
+
+                continue
+
+            mixture_path = matched_partner / "mixture.wav"
+
+            vocal2_path = matched_partner / "vocal2.wav"
+
+            if all(p.exists() for p in [mixture_path, vocal2_path]):
+
+                yield mixture_path, vocal1_path, vocal2_path, background_path
+
+    def __getitem__(self, index):
+        mixture_path, vocal1_path, vocal2_path, background_path = self.tuple_paths[index]
+
+        if self.random_chunks:
+            durations = [
+                load_info(p)["duration"] for p in
+                [mixture_path, vocal1_path, vocal2_path, background_path]
+            ]
+            dur = min(durations)
+            start = random.uniform(0, max(0, dur - self.seq_duration))
+        else:
+            start = 0
+
+        # Load all 4 waveforms
+        mixture, _ = load_audio(mixture_path, start=start, dur=self.seq_duration)
+        vocal1, _ = load_audio(vocal1_path, start=start, dur=self.seq_duration)
+        vocal2, _ = load_audio(vocal2_path, start=start, dur=self.seq_duration)
+        background, _ = load_audio(background_path, start=start, dur=self.seq_duration)
+        
+        # mixture = self._crop_or_pad(mixture)
+        # vocal1 = self._crop_or_pad(vocal1)
+        # vocal2 = self._crop_or_pad(vocal2)
+        # background = self._crop_or_pad(background)
+        
+        mixture, vocal1, vocal2, background = self._crop_or_pad_aligned(
+            mixture, vocal1, vocal2, background
+        )
+        
+        # these are because my solo data are all stereos... I know.. bad.. I should retrain
+        # if mixture.shape[0] == 1:
+        #     mixture = mixture.repeat(2, 1)
+        # if vocal1.shape[0] == 1:
+        #     vocal1 = vocal1.repeat(2, 1)
+        # if vocal2.shape[0] == 1:
+        #     vocal2 = vocal2.repeat(2, 1)
+        # if background.shape[0] == 1:
+        #     background = background.repeat(2, 1)
+
+        return mixture, vocal1, vocal2, background
+    
+    def _crop_or_pad_aligned(self, *audios):
+        """
+        Alignment-safe: all clips keep the same starting point.
+        - If too long: trim from the END (no shifting)
+        - If too short: pad at the END
+        """
+        if self.seq_duration is None:
+            min_len = min(a.shape[-1] for a in audios)
+            return tuple(a[..., :min_len] for a in audios)
+
+        target_len = int(round(self.seq_duration * self.sample_rate))
+
+        out = []
+        for audio in audios:
+            cur_len = audio.shape[-1]
+
+            # trim from end to preserve the exact start alignment
+            if cur_len > target_len:
+                audio = audio[..., :target_len]
+
+            # pad at end to preserve the exact start alignment
+            elif cur_len < target_len:
+                audio = F.pad(audio, (0, target_len - cur_len))
+
+            out.append(audio)
+
+        return tuple(out)
+
+    # def _crop_or_pad(self, audio):
+    #     """Ensure all clips have consistent length (seq_duration seconds)."""
+    #     if self.seq_duration is None:
+    #         return audio  # keep full length if unspecified
+
+    #     max_len = int(self.seq_duration * self.sample_rate)
+    #     cur_len = audio.shape[-1]
+
+    #     if cur_len > max_len:
+    #         print('cropping')
+    #         # random crop if training, center crop otherwise
+    #         if self.random_chunks:
+    #             start = random.randint(0, cur_len - max_len)
+    #         else:
+    #             start = (cur_len - max_len) // 2
+    #         audio = audio[..., start:start + max_len]
+    #     elif cur_len < max_len:
+    #         # zero-pad at the end
+    #         audio = F.pad(audio, (0, max_len - cur_len))
+    #     return audio
+    
+    def __len__(self):
+        return len(self.tuple_paths)
+
+    
+class DuetAlignedDatasetWithEmbeddings(DuetAlignedDataset):
+    """
+    Extension that:
+      - returns vocal1 file paths for embedding lookups
+      - excludes the embedding segment region when sampling audio
+    """
+
+    def __init__(self, *args, emb_map=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.emb_map = emb_map or {}
+        before = len(self.tuple_paths)
+        self.tuple_paths = [
+            tp for tp in self.tuple_paths
+            if str(tp[1]) in self.emb_map and os.path.exists(self.emb_map[str(tp[1])]["embedding_path"])
+        ]
+        print(f"Filtered out {before - len(self.tuple_paths)} samples without embeddings.")
+        self.seq_duration = kwargs.get("seq_duration", 6.0)
+
+    def _exclude_segment(self, duration, file_path):
+        """
+        Returns valid sampling intervals (outside the embedding segment)
+        given total duration and the embedding segment's start/end times.
+        """
+        # Default: whole duration usable
+        valid_regions = [(0.0, duration)]
+
+        entry = self.emb_map.get(file_path)
+        if not entry:
+            return valid_regions  # no embedding, use full clip
+
+        used_seg = entry.get("used_segment_time")
+        if not used_seg:
+            return valid_regions
+
+        emb_start, emb_end = used_seg
+        emb_start = max(0.0, emb_start)
+        emb_end = min(duration, emb_end)
+        
+        if self.seq_duration is None:
+            return [(0.0, duration)]
+
+        # Define remaining regions before and after embedding window
+        valid_regions = []
+        if emb_start > self.seq_duration:
+            valid_regions.append((0.0, emb_start))
+        if duration - emb_end > self.seq_duration:
+            valid_regions.append((emb_end, duration))
+
+        return valid_regions
+
+    def __getitem__(self, index):
+        mixture_path, vocal1_path, vocal2_path, background_path = self.tuple_paths[index]
+
+        durations = [
+            load_info(p)["duration"]
+            for p in [mixture_path, vocal1_path, vocal2_path, background_path]
+        ]
+        dur = min(durations)
+
+        # get usable time intervals (outside embedding region)
+        valid_regions = self._exclude_segment(dur, str(vocal1_path))
+
+        if len(valid_regions) == 0:
+            return self.__getitem__((index + 1) % len(self))
+
+        region = random.choice(valid_regions)
+        region_start, region_end = region
+        
+        if self.seq_duration is None:
+            start = 0.0
+        else:
+            max_start = max(0.0, region_end - region_start - self.seq_duration)
+            start = region_start + random.uniform(0, max_start)
+
+        # Load cropped audio
+        mixture, _ = load_audio(mixture_path, start=start, dur=self.seq_duration)
+        vocal1, _ = load_audio(vocal1_path, start=start, dur=self.seq_duration)
+        vocal2, _ = load_audio(vocal2_path, start=start, dur=self.seq_duration)
+        background, _ = load_audio(background_path, start=start, dur=self.seq_duration)
+        
+        if self.seq_duration is not None:
+            target_len = int(self.seq_duration * self.sample_rate)
+
+            def pad_to_target(wav, target_len):
+                pad_len = target_len - wav.shape[-1]
+                if pad_len > 0:
+                    wav = F.pad(wav, (0, pad_len))
+                return wav
+
+            mixture    = pad_to_target(mixture, target_len)
+            vocal1     = pad_to_target(vocal1, target_len)
+            vocal2     = pad_to_target(vocal2, target_len)
+            background = pad_to_target(background, target_len)
+        
+        # print(f"\n🔍 File: {vocal1_path}")
+        # print(f"  mixture: {mixture.shape}")
+        # print(f"  vocal1 : {vocal1.shape}")
+        # print(f"  vocal2 : {vocal2.shape}")
+        # print(f"  bgm    : {background.shape}")
+        # print(f"  durations: {durations}")
+        # print(f"  region: {region}, start={start:.2f}, dur={self.seq_duration}")
+        
+        # if not (mixture.shape == vocal1.shape == vocal2.shape == background.shape):
+        #     print("❌ Shape mismatch detected!")
+        #     print(f"File: {vocal1_path}")
+        #     print(f"  mixture:   {mixture.shape}")
+        #     print(f"  vocal1:    {vocal1.shape}")
+        #     print(f"  vocal2:    {vocal2.shape}")
+        #     print(f"  background:{background.shape}")
+
+        return mixture, vocal1, vocal2, background, str(vocal1_path)
+
+class AlignedDataset_Embeddings(UnmixDataset):
+    def __init__(
+        self,
+        root: str,
+        split: str = "train",
+        input_file: str = "mixture.wav",
+        output_file: str = "vocals.wav",
+        embedding_file: str = "vocals.wav",  # Use the same vocals file for embeddings (clean)
+        seq_duration: Optional[float] = None,
+        random_chunks: bool = False,
+        sample_rate: float = 44100.0,
+        source_augmentations: Optional[Callable] = None,
+        seed: int = 42,
+        
+        # this is for sanity check
+        save_sample: bool = False,  # Add flag to save audio for debugging
+        save_dir: str = "SOMEWHERE_PLEASE_I_NEED_TO_LISTEN",
+    ) -> None:
+        """Dataset with support for singer embeddings."""
+        self.root = Path(root).expanduser()
+        self.split = split
+        self.sample_rate = sample_rate
+        self.seq_duration = seq_duration
+        self.random_chunks = random_chunks
+        # set the input, output, and embedding files (accept glob)
+        self.input_file = input_file
+        self.output_file = output_file
+        self.embedding_file = embedding_file  # File used for embedding extraction
+        self.tuple_paths = list(self._get_paths())
+        if not self.tuple_paths:
+            raise RuntimeError("Dataset is empty, please check parameters")
+        self.seed = seed
+        random.seed(self.seed)
+        
+        # Save audio sample if needed
+        self.save_sample = save_sample
+        self.save_dir = save_dir
+        if save_sample:
+            os.makedirs(save_dir, exist_ok=True)
+
+    def __getitem__(self, index):
+        input_path, output_path, embedding_path = self.tuple_paths[index]
+        
+        if self.random_chunks:
+            input_info = load_info(input_path)
+            output_info = load_info(output_path)
+            duration = min(input_info["duration"], output_info["duration"])
+            start = random.uniform(0, duration - self.seq_duration)
+        else:
+            start = 0
+
+        X_audio, _ = load_audio(input_path, start=start, dur=self.seq_duration, index=index)
+        Y_audio, _ = load_audio(output_path, start=start, dur=self.seq_duration, index=index)
+        
+        # Save sample if debugging, sanity check 
+        if self.save_sample and index % 20 == 0:  # Save only the first sample
+            # print(input_path)
+            x_audio_path = os.path.join(self.save_dir, f"input_sample_{index}.wav")
+            y_audio_path = os.path.join(self.save_dir, f"output_sample_{index}.wav")
+            torchaudio.save(x_audio_path, X_audio, int(self.sample_rate))
+            torchaudio.save(y_audio_path, Y_audio, int(self.sample_rate))
+            
+        # Return audio data along with the embedding file path
+        return X_audio, Y_audio, str(embedding_path)
+
+    def __len__(self):
+        return len(self.tuple_paths)
+
+    def _get_paths(self):
+        """Loads input, output, and embedding file paths."""
+        p = Path(self.root, self.split)
+        for track_path in tqdm.tqdm(p.iterdir()):
+            if track_path.is_dir():
+                input_path = list(track_path.glob(self.input_file))
+                output_path = list(track_path.glob(self.output_file))
+                embedding_path = list(track_path.glob(self.embedding_file))
+                if input_path and output_path and embedding_path:
+                    if self.seq_duration is not None:
+                        input_info = load_info(input_path[0])
+                        output_info = load_info(output_path[0])
+                        min_duration = min(input_info["duration"], output_info["duration"])
+                        if min_duration > self.seq_duration:
+                            yield input_path[0], output_path[0], embedding_path[0]
+                    else:
+                        yield input_path[0], output_path[0], embedding_path[0]
+                        
+
+class AlignedDataset_Embeddings_Background(UnmixDataset):
+    def __init__(
+        self,
+        root: str,
+        split: str = "train",
+        input_file: str = "mixture.wav",
+        output_file: str = "vocal1.wav",
+        embedding_file: str = "vocal1.wav",  
+        background_file: str = "background.wav", 
+        seq_duration: Optional[float] = None,
+        random_chunks: bool = False,
+        sample_rate: float = 44100.0,
+        source_augmentations: Optional[Callable] = None,
+        seed: int = 42,
+        emb_map: Optional[dict] = None,
+        
+    ) -> None:
+        """Dataset with support for singer embeddings."""
+        self.root = Path(root).expanduser()
+        self.split = split
+        self.sample_rate = sample_rate
+        self.seq_duration = seq_duration
+        self.random_chunks = random_chunks
+        # set the input, output, and embedding files (accept glob)
+        self.input_file = input_file
+        self.output_file = output_file
+        self.embedding_file = embedding_file  # File used for embedding extraction
+        self.background_file = background_file
+        
+        self.emb_map = emb_map or {}
+        self.tuple_paths = list(self._get_paths())
+        if not self.tuple_paths:
+            raise RuntimeError("Dataset is empty, please check parameters")
+        
+        before = len(self.tuple_paths)
+        self.tuple_paths = [
+            tp for tp in self.tuple_paths
+            if str(tp[1]) in self.emb_map and os.path.exists(self.emb_map[str(tp[1])]["embedding_path"])
+        ]
+        print(f"Filtered out {before - len(self.tuple_paths)} samples without embeddings.")
+        self.seed = seed
+        random.seed(self.seed)
+
+    def __getitem__(self, index):
+        input_path, output_path, embedding_path, background_path = self.tuple_paths[index]
+                
+        if self.random_chunks:
+            input_info = load_info(input_path)
+            output_info = load_info(output_path)
+            background_info = load_info(background_path)
+            duration = min(input_info["duration"], output_info["duration"], background_info["duration"])
+            start = random.uniform(0, duration - self.seq_duration)
+        else:
+            start = 0
+
+        X_audio, _ = load_audio(input_path, start=start, dur=self.seq_duration, index=index)
+        Y_audio, _ = load_audio(output_path, start=start, dur=self.seq_duration, index=index)
+        B_audio, _ = load_audio(background_path, start=start, dur=self.seq_duration, index=index)
+
+        # Return audio data along with the embedding file path
+        return X_audio, Y_audio, str(embedding_path), B_audio
+
+    def __len__(self):
+        return len(self.tuple_paths)
+
+    def _get_paths(self):
+        """Loads input, output, and embedding file paths."""
+        p = Path(self.root, self.split)
+        for track_path in tqdm.tqdm(p.iterdir()):
+            if track_path.is_dir():
+                input_path = list(track_path.glob(self.input_file))
+                output_path = list(track_path.glob(self.output_file))
+                embedding_path = list(track_path.glob(self.embedding_file))
+                background_path = list(track_path.glob(self.background_file))
+                if input_path and output_path and embedding_path and background_path:
+                    if self.seq_duration is not None:
+                        input_info = load_info(input_path[0])
+                        output_info = load_info(output_path[0])
+                        min_duration = min(input_info["duration"], output_info["duration"])
+                        if min_duration > self.seq_duration:
+                            yield input_path[0], output_path[0], embedding_path[0], background_path[0]
+                    else:
+                        yield input_path[0], output_path[0], embedding_path[0], background_path[0]
 
 class SourceFolderDataset(UnmixDataset):
     def __init__(
@@ -940,7 +1462,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--seq-dur",
         type=float,
-        default=30.0,
+        default=5.0,
         help="Duration of <=0.0 will result in the full audio",
     )
 
@@ -950,7 +1472,6 @@ if __name__ == "__main__":
 
     torchaudio.set_audio_backend(args.audio_backend)
 
-    print('start loading dataset')
     train_dataset, valid_dataset, args = load_datasets(parser, args)
     print("Audio Backend: ", torchaudio.get_audio_backend())
 
@@ -969,7 +1490,7 @@ if __name__ == "__main__":
 
     # iterate over dataloader
     train_dataset.seq_duration = args.seq_dur
-    
+
     train_sampler = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.batch_size,

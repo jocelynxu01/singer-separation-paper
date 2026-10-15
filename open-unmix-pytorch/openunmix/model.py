@@ -9,7 +9,32 @@ from torch.nn import LSTM, BatchNorm1d, Linear, Parameter
 from .filtering import wiener
 from .transforms import make_filterbanks, ComplexNorm
 
+class FiLMLayer(nn.Module):
+    def __init__(self, feature_dim: int, emb_dim: int):
+        super(FiLMLayer, self).__init__()
+        self.feature_dim = feature_dim
+        self.emb_dim = emb_dim
 
+        # Linear layers to generate scale and shift parameters
+        self.scale = nn.Linear(emb_dim, feature_dim)
+        self.shift = nn.Linear(emb_dim, feature_dim)
+
+    def forward(self, x: Tensor, embedding: Tensor) -> Tensor:
+        """
+        Args:
+            x: Input feature map of shape (batch_size, feature_dim, ...)
+            embedding: Embedding of shape (batch_size, emb_dim)
+
+        Returns:
+            Transformed feature map of shape (batch_size, feature_dim, ...)
+        """
+        # Compute scale and shift parameters
+        scale = self.scale(embedding).unsqueeze(0)  # (1, batch_size, feature_dim)
+        shift = self.shift(embedding).unsqueeze(0)  # (1, batch_size, feature_dim)
+
+        # Apply feature-wise affine transformation
+        return x * scale + shift
+    
 class OpenUnmix(nn.Module):
     """OpenUnmix Core spectrogram based separation module.
 
@@ -32,7 +57,7 @@ class OpenUnmix(nn.Module):
     def __init__(
         self,
         nb_bins: int = 4096,
-        nb_channels: int = 2,
+        nb_channels: int = 1,
         hidden_size: int = 512,
         nb_layers: int = 3,
         unidirectional: bool = False,
@@ -41,7 +66,7 @@ class OpenUnmix(nn.Module):
         max_bin: Optional[int] = None,
     ):
         super(OpenUnmix, self).__init__()
-
+        
         self.nb_output_bins = nb_bins
         if max_bin:
             self.nb_bins = max_bin
@@ -118,7 +143,8 @@ class OpenUnmix(nn.Module):
         # permute so that batch is last for lstm
         x = x.permute(3, 0, 1, 2)
         # get current spectrogram shape
-        nb_frames, nb_samples, nb_channels, nb_bins = x.data.shape
+        nb_frames, nb_samples, nb_channels, nb_bins = x.data.shape # [259, 16, 2, 2081]
+        # print("shape",nb_frames, nb_samples, nb_channels, nb_bins )
 
         mix = x.detach().clone()
 
@@ -164,7 +190,334 @@ class OpenUnmix(nn.Module):
         x = F.relu(x) * mix
         # permute back to (nb_samples, nb_channels, nb_bins, nb_frames)
         return x.permute(1, 2, 3, 0)
+    
 
+class OpenUnmix_Embedding(nn.Module):
+    """OpenUnmix Core spectrogram based separation module.
+
+    Args:
+        nb_bins (int): Number of input time-frequency bins (Default: `4096`).
+        nb_channels (int): Number of input audio channels (Default: `2`).
+        hidden_size (int): Size for bottleneck layers (Default: `512`).
+        nb_layers (int): Number of Bi-LSTM layers (Default: `3`).
+        unidirectional (bool): Use causal model useful for realtime purpose.
+            (Default `False`)
+        input_mean (ndarray or None): global data mean of shape `(nb_bins, )`.
+            Defaults to zeros(nb_bins)
+        input_scale (ndarray or None): global data mean of shape `(nb_bins, )`.
+            Defaults to ones(nb_bins)
+        max_bin (int or None): Internal frequency bin threshold to
+            reduce high frequency content. Defaults to `None` which results
+            in `nb_bins`
+    """
+
+    def __init__(
+        self,
+        nb_bins: int = 4096,
+        nb_channels: int = 1,
+        hidden_size: int = 512,
+        nb_layers: int = 3,
+        unidirectional: bool = False,
+        input_mean: Optional[np.ndarray] = None,
+        input_scale: Optional[np.ndarray] = None,
+        max_bin: Optional[int] = None,
+        emb_dim: int = 32,  # Add embedding dimension
+    ):
+        super(OpenUnmix_Embedding, self).__init__()
+
+        self.nb_output_bins = nb_bins
+        if max_bin:
+            self.nb_bins = max_bin
+        else:
+            self.nb_bins = self.nb_output_bins
+
+        self.hidden_size = hidden_size
+        self.emb_dim = emb_dim
+
+        # self.fc1 = Linear(self.nb_bins * nb_channels, hidden_size, bias=False)
+        self.fc1 = Linear((self.nb_bins + emb_dim) * nb_channels, hidden_size, bias=False)
+
+        self.bn1 = BatchNorm1d(hidden_size)
+
+        if unidirectional:
+            lstm_hidden_size = hidden_size
+        else:
+            lstm_hidden_size = hidden_size // 2
+
+        self.lstm = LSTM(
+            input_size=hidden_size,
+            hidden_size=lstm_hidden_size,
+            num_layers=nb_layers,
+            bidirectional=not unidirectional,
+            batch_first=False,
+            dropout=0.4 if nb_layers > 1 else 0,
+        )
+
+        fc2_hiddensize = hidden_size * 2
+        self.fc2 = Linear(in_features=fc2_hiddensize, out_features=hidden_size, bias=False)
+
+        self.bn2 = BatchNorm1d(hidden_size)
+
+        self.fc3 = Linear(
+            in_features=hidden_size,
+            out_features=self.nb_output_bins * nb_channels,
+            bias=False,
+        )
+
+        self.bn3 = BatchNorm1d(self.nb_output_bins * nb_channels)
+
+        if input_mean is not None:
+            input_mean = torch.from_numpy(-input_mean[: self.nb_bins]).float()
+        else:
+            input_mean = torch.zeros(self.nb_bins)
+
+        if input_scale is not None:
+            input_scale = torch.from_numpy(1.0 / input_scale[: self.nb_bins]).float()
+        else:
+            input_scale = torch.ones(self.nb_bins)
+
+        self.input_mean = Parameter(input_mean)
+        self.input_scale = Parameter(input_scale)
+
+        self.output_scale = Parameter(torch.ones(self.nb_output_bins).float())
+        self.output_mean = Parameter(torch.ones(self.nb_output_bins).float())
+
+    def freeze(self):
+        # set all parameters as not requiring gradient, more RAM-efficient
+        # at test time
+        for p in self.parameters():
+            p.requires_grad = False
+        self.eval()
+
+    def forward(self, x: Tensor, embeddings: Tensor) -> Tensor:
+        """
+        Args:
+            x: input spectrogram of shape
+                `(nb_samples, nb_channels, nb_bins, nb_frames)`
+
+        Returns:
+            Tensor: filtered spectrogram of shape
+                `(nb_samples, nb_channels, nb_bins, nb_frames)`
+        """
+
+        # permute so that batch is last for lstm
+        x_no_embedding = x.permute(3, 0, 1, 2)
+                        
+        embeddings = embeddings.unsqueeze(-1).expand(-1, -1, -1, x_no_embedding.shape[0])  # (batch, channels, emb_dim, frames)
+        embeddings = embeddings.permute(3, 0, 1, 2)  # (frames, batch, channels, emb_dim)
+        
+        x = torch.cat([x_no_embedding, embeddings], dim=3)  # (frames, batch, channels, bins + emb_dim)
+        
+        # get current spectrogram shape
+        nb_frames, nb_samples, nb_channels, nb_bins = x.data.shape #[259, 16, 1, 2081]
+        
+        mix = x_no_embedding.detach().clone() # [259, 16, 1, 2049]
+        # crop
+        # x = x[..., : self.nb_bins]
+        x = x[..., : self.nb_bins + self.emb_dim]
+        
+        input_mean_padded = F.pad(self.input_mean, (0, self.emb_dim), mode='constant', value=0)
+        input_scale_padded = F.pad(self.input_scale, (0, self.emb_dim), mode='constant', value=1)
+    
+        # shift and scale input to mean=0 std=1 (across all bins)
+        x = x + input_mean_padded #self.input_mean
+        x = x * input_scale_padded #self.input_scale
+        # x shape: 259, 16, 2, 1519
+        
+        # to (nb_frames*nb_samples, nb_channels*nb_bins)
+        # and encode to (nb_frames*nb_samples, hidden_size)
+        # x = self.fc1(x.reshape(-1, nb_channels * self.nb_bins))
+        x = self.fc1(x.reshape(-1, nb_channels * (self.nb_bins + self.emb_dim)))
+                
+        # normalize every instance in a batch
+        x = self.bn1(x)
+        x = x.reshape(nb_frames, nb_samples, self.hidden_size)
+        # squash range ot [-1, 1]
+        x = torch.tanh(x)
+        
+        # apply 3-layers of stacked LSTM
+        lstm_out = self.lstm(x)
+
+        # lstm skip connection
+        x = torch.cat([x, lstm_out[0]], -1)
+        
+        # first dense stage + batch norm
+        x = self.fc2(x.reshape(-1, x.shape[-1]))
+        x = self.bn2(x)
+        
+        x = F.relu(x)
+
+        # second dense stage + layer norm
+        x = self.fc3(x)
+        x = self.bn3(x)
+
+        # reshape back to original dim
+        x = x.reshape(nb_frames, nb_samples, nb_channels, self.nb_output_bins)
+        # x = x.reshape(nb_frames, nb_samples, nb_channels, self.nb_bins)
+
+        # apply output scaling
+        x *= self.output_scale
+        x += self.output_mean
+        
+        # since our output is non-negative, we can apply RELU
+        x = F.relu(x) * mix
+        # permute back to (nb_samples, nb_channels, nb_bins, nb_frames)
+        return x.permute(1, 2, 3, 0)
+    
+class OpenUnmix_FiLM(nn.Module):
+    def __init__(
+        self,
+        nb_bins: int = 4096,
+        nb_channels: int = 2,
+        hidden_size: int = 512,
+        nb_layers: int = 3,
+        unidirectional: bool = False,
+        input_mean: Optional[np.ndarray] = None,
+        input_scale: Optional[np.ndarray] = None,
+        max_bin: Optional[int] = None,
+        emb_dim: int = 32,  # Add embedding dimension
+    ):
+        super(OpenUnmix_FiLM, self).__init__()
+
+        self.nb_output_bins = nb_bins
+        if max_bin:
+            self.nb_bins = max_bin
+        else:
+            self.nb_bins = self.nb_output_bins
+
+        self.hidden_size = hidden_size
+        self.emb_dim = emb_dim
+
+        # Input fully connected layer
+        self.fc1 = Linear(self.nb_bins * nb_channels, hidden_size, bias=False)
+        self.bn1 = BatchNorm1d(hidden_size)
+
+        # FiLM layer after the first fully connected layer
+        self.film1 = FiLMLayer(feature_dim=hidden_size, emb_dim=emb_dim)
+
+        # LSTM layers
+        if unidirectional:
+            lstm_hidden_size = hidden_size
+        else:
+            lstm_hidden_size = hidden_size // 2
+
+        self.lstm = LSTM(
+            input_size=hidden_size,
+            hidden_size=lstm_hidden_size,
+            num_layers=nb_layers,
+            bidirectional=not unidirectional,
+            batch_first=False,
+            dropout=0.4 if nb_layers > 1 else 0,
+        )
+
+        # FiLM layer after LSTM
+        self.film2 = FiLMLayer(feature_dim=hidden_size, emb_dim=emb_dim)
+
+        # Output fully connected layers
+        self.fc2 = Linear(hidden_size * 2, hidden_size, bias=False)
+        self.bn2 = BatchNorm1d(hidden_size)
+
+        self.fc3 = Linear(hidden_size, self.nb_output_bins * nb_channels, bias=False)
+        self.bn3 = BatchNorm1d(self.nb_output_bins * nb_channels)
+
+        # Input normalization
+        if input_mean is not None:
+            input_mean = torch.from_numpy(-input_mean[: self.nb_bins]).float()
+        else:
+            input_mean = torch.zeros(self.nb_bins)
+
+        if input_scale is not None:
+            input_scale = torch.from_numpy(1.0 / input_scale[: self.nb_bins]).float()
+        else:
+            input_scale = torch.ones(self.nb_bins)
+
+        self.input_mean = Parameter(input_mean)
+        self.input_scale = Parameter(input_scale)
+
+        # Output scaling
+        self.output_scale = Parameter(torch.ones(self.nb_output_bins).float())
+        self.output_mean = Parameter(torch.ones(self.nb_output_bins).float())
+
+    def freeze(self):
+        # set all parameters as not requiring gradient, more RAM-efficient
+        # at test time
+        for p in self.parameters():
+            p.requires_grad = False
+        self.eval()
+
+    def forward(self, x: Tensor, embeddings: Tensor) -> Tensor:
+        """
+        Args:
+            x: input spectrogram of shape
+                `(nb_samples, nb_channels, nb_bins, nb_frames)`
+            embeddings: embeddings of shape
+                `(nb_samples, emb_dim)`
+
+        Returns:
+            Tensor: filtered spectrogram of shape
+                `(nb_samples, nb_channels, nb_bins, nb_frames)`
+        """
+        # permute so that batch is last for lstm
+        x = x.permute(3, 0, 1, 2)  # (nb_frames, nb_samples, nb_channels, nb_bins)
+
+        # get current spectrogram shape
+        nb_frames, nb_samples, nb_channels, nb_bins = x.shape
+
+        mix = x.detach().clone()
+
+        # crop
+        x = x[..., : self.nb_bins]
+
+        # shift and scale input to mean=0 std=1 (across all bins)
+        x = x + self.input_mean
+        x = x * self.input_scale
+
+        # to (nb_frames*nb_samples, nb_channels*nb_bins)
+        x = self.fc1(x.reshape(-1, nb_channels * self.nb_bins))
+
+        # normalize every instance in a batch
+        x = self.bn1(x)
+
+        # Apply FiLM after the first fully connected layer
+        x = self.film1(x.reshape(nb_frames, nb_samples, self.hidden_size), embeddings)
+        x = x.reshape(-1, self.hidden_size)
+
+        # squash range to [-1, 1]
+        x = torch.tanh(x)
+
+        # apply 3-layers of stacked LSTM
+        lstm_out = self.lstm(x.reshape(nb_frames, nb_samples, self.hidden_size))
+
+        # Apply FiLM after LSTM
+        lstm_out = self.film2(lstm_out[0], embeddings)
+
+        # lstm skip connection
+        x = torch.cat([x.reshape(nb_frames, nb_samples, self.hidden_size), lstm_out], -1)
+
+        # first dense stage + batch norm
+        x = self.fc2(x.reshape(-1, x.shape[-1]))
+        x = self.bn2(x)
+
+        x = F.relu(x)
+
+        # second dense stage + layer norm
+        x = self.fc3(x)
+        x = self.bn3(x)
+
+        # reshape back to original dim
+        x = x.reshape(nb_frames, nb_samples, nb_channels, self.nb_output_bins)
+
+        # apply output scaling
+        x *= self.output_scale
+        x += self.output_mean
+
+        # since our output is non-negative, we can apply RELU
+        x = F.relu(x) * mix
+
+        # permute back to (nb_samples, nb_channels, nb_bins, nb_frames)
+        return x.permute(1, 2, 3, 0)
+    
+#########################################################################HERE COMES THE SEPARATOR###############################################################
 
 class Separator(nn.Module):
     """
@@ -250,21 +603,200 @@ class Separator(nn.Module):
             Tensor: stacked tensor of separated waveforms
                 shape `(nb_samples, nb_targets, nb_channels, nb_timesteps)`
         """
-
+        
+            
         nb_sources = self.nb_targets
         nb_samples = audio.shape[0]
 
         # getting the STFT of mix:
         # (nb_samples, nb_channels, nb_bins, nb_frames, 2)
-        mix_stft = self.stft(audio)
-        X = self.complexnorm(mix_stft)
+        mix_stft = self.stft(audio) # encoder
+        X = self.complexnorm(mix_stft) #2 channels to 1 channel, [1, 2, 2049, 1293]
+        # I need to add my embeddings here
+                
+        # print("Min value:", X.min().item())
+        # print("Max value:", X.max().item())
+        
+        # if embedding is not None:
+        #     print('I am ready to embed')
+        #     # broadcast way
+        #     X = X + embedding
+        #     # X = torch.cat([X, embedding], dim=3)    
+        #     # X = X[:, :, :, 1:] 
 
         # initializing spectrograms variable
-        spectrograms = torch.zeros(X.shape + (nb_sources,), dtype=audio.dtype, device=X.device)
+        spectrograms = torch.zeros(X.shape + (nb_sources,), dtype=audio.dtype, device=X.device) # [1, 2, 2049, 1293, num_of_targets]
 
         for j, (target_name, target_module) in enumerate(self.target_models.items()):
             # apply current model to get the source spectrogram
-            target_spectrogram = target_module(X.detach().clone())
+            # print(target_module) #model layers (eg. lstm)
+            target_spectrogram = target_module(X.detach().clone()) # here, I need to make changes - parse in embeddings as well
+            spectrograms[..., j] = target_spectrogram
+            
+        # transposing it as
+        # (nb_samples, nb_frames, nb_bins,{1,nb_channels}, nb_sources)
+        spectrograms = spectrograms.permute(0, 3, 2, 1, 4)
+
+        # rearranging it into:
+        # (nb_samples, nb_frames, nb_bins, nb_channels, 2) to feed
+        # into filtering methods
+        mix_stft = mix_stft.permute(0, 3, 2, 1, 4)
+
+        # create an additional target if we need to build a residual
+        if self.residual:
+            # we add an additional target
+            nb_sources += 1
+
+        if nb_sources == 1 and self.niter > 0:
+            raise Exception(
+                "Cannot use EM if only one target is estimated."
+                "Provide two targets or create an additional "
+                "one with `--residual`"
+            )
+
+        nb_frames = spectrograms.shape[1]
+        targets_stft = torch.zeros(mix_stft.shape + (nb_sources,), dtype=audio.dtype, device=mix_stft.device)
+        for sample in range(nb_samples):
+            pos = 0
+            if self.wiener_win_len:
+                wiener_win_len = self.wiener_win_len
+            else:
+                wiener_win_len = nb_frames
+            while pos < nb_frames:
+                cur_frame = torch.arange(pos, min(nb_frames, pos + wiener_win_len))
+                pos = int(cur_frame[-1]) + 1
+
+                targets_stft[sample, cur_frame] = wiener(
+                    spectrograms[sample, cur_frame],
+                    mix_stft[sample, cur_frame],
+                    self.niter,
+                    softmask=self.softmask,
+                    residual=self.residual,
+                )
+
+        # getting to (nb_samples, nb_targets, channel, fft_size, n_frames, 2)
+        targets_stft = targets_stft.permute(0, 5, 3, 2, 1, 4).contiguous()
+
+        # inverse STFT
+        estimates = self.istft(targets_stft, length=audio.shape[2])
+
+        return estimates
+
+    def to_dict(self, estimates: Tensor, aggregate_dict: Optional[dict] = None) -> dict:
+        """Convert estimates as stacked tensor to dictionary
+
+        Args:
+            estimates (Tensor): separated targets of shape
+                (nb_samples, nb_targets, nb_channels, nb_timesteps)
+            aggregate_dict (dict or None)
+
+        Returns:
+            (dict of str: Tensor):
+        """
+        estimates_dict = {}
+        for k, target in enumerate(self.target_models):
+            estimates_dict[target] = estimates[:, k, ...]
+
+        # in the case of residual, we added another source
+        if self.residual:
+            estimates_dict["residual"] = estimates[:, -1, ...]
+
+        if aggregate_dict is not None:
+            new_estimates = {}
+            for key in aggregate_dict:
+                new_estimates[key] = torch.tensor(0.0)
+                for target in aggregate_dict[key]:
+                    new_estimates[key] = new_estimates[key] + estimates_dict[target]
+            estimates_dict = new_estimates
+        return estimates_dict
+
+
+class Separator_Embedding(nn.Module):
+    def __init__(
+        self,
+        target_models: Mapping[str, nn.Module],
+        niter: int = 0,
+        softmask: bool = False,
+        residual: bool = False,
+        sample_rate: float = 44100.0,
+        n_fft: int = 4096,
+        n_hop: int = 1024,
+        nb_channels: int = 2,
+        wiener_win_len: Optional[int] = 300,
+        filterbank: str = "torch",
+    ):
+        super(Separator_Embedding, self).__init__()
+
+        # saving parameters
+        self.niter = niter
+        self.residual = residual
+        self.softmask = softmask
+        self.wiener_win_len = wiener_win_len
+
+        self.stft, self.istft = make_filterbanks(
+            n_fft=n_fft,
+            n_hop=n_hop,
+            center=True,
+            method=filterbank,
+            sample_rate=sample_rate,
+        )
+        self.complexnorm = ComplexNorm(mono=nb_channels == 1)
+
+        # registering the targets models
+        self.target_models = nn.ModuleDict(target_models)
+        # adding till https://github.com/pytorch/pytorch/issues/38963
+        self.nb_targets = len(self.target_models)
+        # get the sample_rate as the sample_rate of the first model
+        # (tacitly assume it's the same for all targets)
+        self.register_buffer("sample_rate", torch.as_tensor(sample_rate))
+
+    def freeze(self):
+        # set all parameters as not requiring gradient, more RAM-efficient
+        # at test time
+        for p in self.parameters():
+            p.requires_grad = False
+        self.eval()
+
+    def forward(self, audio: Tensor, embedding: Optional[Tensor] = None) -> Tensor:
+        """Performing the separation on audio input
+
+        Args:
+            audio (Tensor): [shape=(nb_samples, nb_channels, nb_timesteps)]
+                mixture audio waveform
+            embedding (Tensor): [shape=(nb_samples, nb_channels, emb_dim)]
+                embeddings for conditioning the separation
+
+        Returns:
+            Tensor: stacked tensor of separated waveforms
+                shape `(nb_samples, nb_targets, nb_channels, nb_timesteps)`
+        """
+        nb_sources = self.nb_targets
+        nb_samples = audio.shape[0]
+
+        # getting the STFT of mix:
+        # (nb_samples, nb_channels, nb_bins, nb_frames, 2)
+        mix_stft = self.stft(audio)  # encoder
+        X = self.complexnorm(mix_stft)  # 2 channels to 1 channel, [1, 2, 2049, 1293]
+
+        # Broadcast embeddings to match the shape of X
+        if embedding is not None:
+            print('I am ready to embed')
+            # Ensure embeddings have the correct shape: (nb_samples, nb_channels, emb_dim)
+            embeddings_broadcasted = embedding.unsqueeze(1).expand(-1, X.shape[1], -1) 
+        else:
+            embeddings_broadcasted = None
+
+        # initializing spectrograms variable
+        spectrograms = torch.zeros(X.shape + (nb_sources,), dtype=audio.dtype, device=X.device)  # [1, 2, 2049, 1293, num_of_targets]
+
+        for j, (target_name, target_module) in enumerate(self.target_models.items()):
+            # apply current model to get the source spectrogram
+            if embeddings_broadcasted is not None:
+                # Pass embeddings to the target model
+                target_spectrogram = target_module(X.detach().clone(), embeddings_broadcasted)
+            else:
+                # If no embeddings, pass only the spectrogram
+                target_spectrogram = target_module(X.detach().clone())
             spectrograms[..., j] = target_spectrogram
 
         # transposing it as

@@ -112,7 +112,7 @@ class EarlyStopping(object):
             self.is_better = lambda a, best: a > best + min_delta
 
 
-def load_target_models(targets, model_str_or_path="umxl", device="cpu", pretrained=True):
+def load_target_models(targets, model_str_or_path="umxl", device="cpu", pretrained=True, embedding=None):
     """Core model loader
 
     target model path can be either <target>.pth, or <target>-sha256.pth
@@ -147,12 +147,21 @@ def load_target_models(targets, model_str_or_path="umxl", device="cpu", pretrain
             target_model_path = next(Path(model_path).glob("%s*.pth" % target))
             state = torch.load(target_model_path, map_location=device)
 
-            models[target] = model.OpenUnmix(
-                nb_bins=results["args"]["nfft"] // 2 + 1,
-                nb_channels=results["args"]["nb_channels"],
-                hidden_size=results["args"]["hidden_size"],
-                max_bin=state["input_mean"].shape[0],
-            )
+            if embedding is None:
+                models[target] = model.OpenUnmix(
+                    nb_bins=results["args"]["nfft"] // 2 + 1,
+                    nb_channels=results["args"]["nb_channels"],
+                    hidden_size=results["args"]["hidden_size"],
+                    max_bin=state["input_mean"].shape[0],
+                )
+            else:
+                print('use openunmix embedding')
+                models[target] = model.OpenUnmix_Embedding(
+                    nb_bins=results["args"]["nfft"] // 2 + 1,
+                    nb_channels=results["args"]["nb_channels"],
+                    hidden_size=results["args"]["hidden_size"],
+                    max_bin=state["input_mean"].shape[0],
+                )
 
             if pretrained:
                 models[target].load_state_dict(state, strict=False)
@@ -170,6 +179,7 @@ def load_separator(
     device: Union[str, torch.device] = "cpu",
     pretrained: bool = True,
     filterbank: str = "torch",
+    embedding: torch.Tensor = None,
 ):
     """Separator loader
 
@@ -212,22 +222,36 @@ def load_separator(
         if targets is None:
             raise UserWarning("For custom models, please specify the targets")
 
-        target_models = load_target_models(targets=targets, model_str_or_path=model_path, pretrained=pretrained)
+        target_models = load_target_models(targets=targets, model_str_or_path=model_path, pretrained=pretrained, embedding=embedding)
 
         with open(Path(model_path, "separator.json"), "r") as stream:
             enc_conf = json.load(stream)
-
-        separator = model.Separator(
-            target_models=target_models,
-            niter=niter,
-            residual=residual,
-            wiener_win_len=wiener_win_len,
-            sample_rate=enc_conf["sample_rate"],
-            n_fft=enc_conf["nfft"],
-            n_hop=enc_conf["nhop"],
-            nb_channels=enc_conf["nb_channels"],
-            filterbank=filterbank,
-        ).to(device)
+            
+        if embedding is None:
+            separator = model.Separator(
+                target_models=target_models,
+                niter=niter,
+                residual=residual,
+                wiener_win_len=wiener_win_len,
+                sample_rate=enc_conf["sample_rate"],
+                n_fft=enc_conf["nfft"],
+                n_hop=enc_conf["nhop"],
+                nb_channels=enc_conf["nb_channels"],
+                filterbank=filterbank,
+            ).to(device)
+        else:    
+            print('Use Separatror Embedding')  
+            separator = model.Separator_Embedding(
+                target_models=target_models,
+                niter=niter,
+                residual=residual,
+                wiener_win_len=wiener_win_len,
+                sample_rate=enc_conf["sample_rate"],
+                n_fft=enc_conf["nfft"],
+                n_hop=enc_conf["nhop"],
+                nb_channels=enc_conf["nb_channels"],
+                filterbank=filterbank,
+            ).to(device)
 
     # otherwise we load the separator from torchhub
     else:

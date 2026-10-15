@@ -3,6 +3,7 @@ from openunmix import utils
 
 def separate(
     audio,
+    embedding=None,
     rate=None,
     model_str_or_path="umxl",
     targets=None,
@@ -13,6 +14,7 @@ def separate(
     separator=None,
     device=None,
     filterbank="torch",
+    pretrained=True,
 ):
     """
     Open Unmix functional interface
@@ -52,6 +54,8 @@ def separate(
             asteroids stft can be exported to onnx, which makes is practical
             for deployment.
     """
+    print(device)
+
     if separator is None:
         separator = utils.load_separator(
             model_str_or_path=model_str_or_path,
@@ -60,8 +64,9 @@ def separate(
             residual=residual,
             wiener_win_len=wiener_win_len,
             device=device,
-            pretrained=True,
+            pretrained=pretrained,
             filterbank=filterbank,
+            embedding=embedding
         )
         separator.freeze()
         if device:
@@ -72,9 +77,14 @@ def separate(
 
     if device:
         audio = audio.to(device)
+        if embedding is not None:
+            embedding = embedding.to(device)
     audio = utils.preprocess(audio, rate, separator.sample_rate)
 
     # getting the separated signals
-    estimates = separator(audio)
+    if embedding is None:
+        estimates = separator(audio)
+    else:
+        estimates = separator(audio, embedding)
     estimates = separator.to_dict(estimates, aggregate_dict=aggregate_dict)
     return estimates
